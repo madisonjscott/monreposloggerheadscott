@@ -1,0 +1,925 @@
+---
+title: "Final Thesis Analyses: Loggerhead Clutch Relocation at Mon Repos"
+author: "Madison Scott"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# FINAL THESIS ANALYSES
+# ============================================================
+#Raw data are not publicly available due to a data-sharing agreement with the Queensland Department of the Environment, Tourism, Science and Innovation (DETSI).The repository contains all code required to reproduce analyses and figures. Access to the original data must be requested through DETSI.
+#
+# This RMarkdown is intended to recreate the final statistical
+# tests, summary tables, and figures used in the thesis.
+#
+# Expected input files:
+#   data/qnr_dataset2.csv
+#   data/badnest(1).csv
+#   data/MR24_emergeEditV1 copy.csv
+#
+# If these files are in the same folder as this RMarkdown, the
+# fallback paths below should still work.
+# ============================================================
+
+required_packages <- c(
+  "tidyverse", "lubridate", "betareg", "lmtest", "emmeans",
+  "lme4", "broom", "broom.mixed", "gt", "patchwork"
+)
+
+installed <- rownames(installed.packages())
+missing_packages <- setdiff(required_packages, installed)
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(tidyverse)
+library(lubridate)
+library(betareg)
+library(lmtest)
+library(emmeans)
+library(lme4)
+library(broom)
+library(broom.mixed)
+library(gt)
+library(patchwork)
+
+theme_set(theme_classic(base_size = 14))
+
+dir.create("figures/final", recursive = TRUE, showWarnings = FALSE)
+dir.create("tables/final", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/model_summaries", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/cleaned", recursive = TRUE, showWarnings = FALSE)
+
+# Helper function for beta regression proportions.
+beta_transform <- function(y) {
+  n <- length(y[!is.na(y)])
+  (y * (n - 1) + 0.5) / n
+}
+
+find_file <- function(possible_paths) {
+  existing <- possible_paths[file.exists(possible_paths)]
+  if (length(existing) == 0) {
+    stop("Could not find file. Checked: ", paste(possible_paths, collapse = ", "))
+  }
+  existing[1]
+}
+
+qmr_path <- find_file(c("data/qnr_dataset2.csv", "qnr_dataset2.csv", "/mnt/data/qnr_dataset2.csv"))
+badnest_path <- find_file(c("data/badnest(1).csv", "badnest(1).csv", "/mnt/data/badnest(1).csv"))
+raw_path <- find_file(c("data/MR24_emergeEditV1 copy.csv", "MR24_emergeEditV1 copy.csv", "/mnt/data/MR24_emergeEditV1 copy.csv"))
+
+qmr_dataset2 <- read.csv(qmr_path)
+badnest <- read.csv(badnest_path)
+raw_emerge <- read.csv(raw_path)
+```
+
+# 1. Final data preparation checks
+
+```{r data-prep}
+# Standardise final analysis columns.
+qmr_dataset2 <- qmr_dataset2 %>%
+  mutate(
+    RELOC_binary = case_when(
+      !is.na(RELOC_binary) ~ as.character(RELOC_binary),
+      !is.na(reloc_binary) ~ as.character(reloc_binary),
+      is.na(RELOC) ~ "INS",
+      TRUE ~ "R"
+    ),
+    RELOC_binary = case_when(
+      RELOC_binary %in% c("INS", "In situ", "In Situ", "In situ ") ~ "INS",
+      RELOC_binary %in% c("R", "Relocated", "relocated") ~ "R",
+      TRUE ~ RELOC_binary
+    ),
+    Nest_management = recode(RELOC_binary, "INS" = "In situ", "R" = "Relocated"),
+    RELOC_type = case_when(
+      RELOC_binary == "INS" ~ "INS",
+      TRUE ~ as.character(RELOC_type)
+    ),
+    RELOC_type = recode(RELOC_type,
+                        "INS" = "In situ",
+                        "DUNE" = "Dune",
+                        "HATCH" = "Hatchery",
+                        "CAGE" = "Cage"),
+    RELOC_type = factor(RELOC_type, levels = c("In situ", "Dune", "Hatchery", "Cage")),
+    Nest_management = factor(Nest_management, levels = c("In situ", "Relocated")),
+    CNO = as.numeric(CNO),
+    AGECL = factor(AGECL, levels = paste0("A", sort(as.numeric(gsub("A", "", unique(AGECL[!is.na(AGECL)])))))),
+    ESUC_prop = ifelse(ESUC > 1, ESUC / 100, ESUC),
+    HSUC_prop = ifelse(HSUC > 1, HSUC / 100, HSUC),
+    ESUC_prop_beta = beta_transform(ESUC_prop),
+    TAG = as.factor(TAG),
+    LDATE_date = suppressWarnings(as.Date(LDATE_date)),
+    LDATE_numeric = as.numeric(LDATE_numeric)
+  ) %>%
+  filter(!is.na(ESUC_prop), !is.na(ESUC_prop_beta))
+
+badnest <- badnest %>%
+  mutate(
+    RELOC_binary = case_when(
+      !is.na(RELOC_binary) ~ as.character(RELOC_binary),
+      !is.na(reloc_binary) ~ as.character(reloc_binary),
+      is.na(RELOC) ~ "INS",
+      TRUE ~ "R"
+    ),
+    RELOC_binary = case_when(
+      RELOC_binary %in% c("INS", "In situ", "In Situ", "In situ ") ~ "INS",
+      RELOC_binary %in% c("R", "Relocated", "relocated") ~ "R",
+      TRUE ~ RELOC_binary
+    ),
+    Nest_management = recode(RELOC_binary, "INS" = "In situ", "R" = "Relocated"),
+    RELOC_type = case_when(
+      RELOC_binary == "INS" ~ "INS",
+      TRUE ~ as.character(RELOC_type)
+    ),
+    RELOC_type = recode(RELOC_type,
+                        "INS" = "In situ",
+                        "DUNE" = "Dune",
+                        "HATCH" = "Hatchery",
+                        "CAGE" = "Cage"),
+    RELOC_type = factor(RELOC_type, levels = c("In situ", "Dune", "Hatchery", "Cage")),
+    Nest_management = factor(Nest_management, levels = c("In situ", "Relocated")),
+    CNO = as.numeric(CNO),
+    AGECL = factor(AGECL, levels = paste0("A", sort(as.numeric(gsub("A", "", unique(AGECL[!is.na(AGECL)])))))),
+    ESUC_prop = ifelse(ESUC > 1, ESUC / 100, ESUC),
+    HSUC_prop = ifelse(HSUC > 1, HSUC / 100, HSUC),
+    ESUC_prop_beta = beta_transform(ESUC_prop),
+    TAG = as.factor(TAG),
+    LDATE_numeric = as.numeric(LDATE_numeric)
+  ) %>%
+  filter(!is.na(ESUC_prop), !is.na(ESUC_prop_beta))
+
+stage_cols <- c("UD", "UH2", "UH3", "UH4", "UH5", "UH6")
+stage_labels <- c(
+  UD = "Undeveloped",
+  UH2 = "Stage 2",
+  UH3 = "Stage 3",
+  UH4 = "Stage 4",
+  UH5 = "Stage 5",
+  UH6 = "Stage 6"
+)
+
+# Save final cleaned datasets
+write.csv(qmr_dataset2, "data/cleaned/qmr_dataset2_cleaned.csv", row.names = FALSE)
+write.csv(badnest, "data/cleaned/badnest_cleaned.csv", row.names = FALSE)
+
+# Basic counts used in thesis
+overall_summary <- qmr_dataset2 %>%
+  summarise(
+    n_clutches = n(),
+    n_individuals = n_distinct(TAG),
+    mean_ESUC = mean(ESUC, na.rm = TRUE),
+    se_ESUC = sd(ESUC, na.rm = TRUE) / sqrt(sum(!is.na(ESUC)))
+  )
+
+reloc_counts <- qmr_dataset2 %>%
+  count(Nest_management)
+
+overall_summary
+reloc_counts
+```
+
+# 2. Relocation status and emergence success
+
+```{r relocation-status-model}
+reloc_summary <- qmr_dataset2 %>%
+  group_by(Nest_management) %>%
+  summarise(
+    n = n(),
+    mean_ESUC = mean(ESUC, na.rm = TRUE),
+    sd_ESUC = sd(ESUC, na.rm = TRUE),
+    se_ESUC = sd_ESUC / sqrt(n),
+    mean_ESUC_prop = mean(ESUC_prop, na.rm = TRUE),
+    se_ESUC_prop = sd(ESUC_prop, na.rm = TRUE) / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(reloc_summary, "tables/final/relocation_status_summary.csv", row.names = FALSE)
+
+beta_reloc <- betareg(ESUC_prop_beta ~ Nest_management, data = qmr_dataset2)
+beta_reloc_null <- betareg(ESUC_prop_beta ~ 1, data = qmr_dataset2)
+
+reloc_lrtest <- lmtest::lrtest(beta_reloc, beta_reloc_null)
+
+sink("outputs/model_summaries/beta_relocation_status.txt")
+print(summary(beta_reloc))
+print(reloc_lrtest)
+print(confint(beta_reloc))
+sink()
+
+summary(beta_reloc)
+reloc_lrtest
+confint(beta_reloc)
+```
+
+```{r figure-2-relocation-status, fig.width=7, fig.height=5}
+fig2 <- ggplot(qmr_dataset2, aes(x = Nest_management, y = ESUC_prop, fill = Nest_management)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1.7) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Nest relocation status",
+    y = "Emergence success",
+    fill = "Nest management"
+  ) +
+  theme(legend.position = "none")
+
+fig2
+ggsave("figures/final/Figure_2_relocation_status_ESUC.png", fig2, width = 7, height = 5, dpi = 300)
+```
+
+# 3. Developmental-stage mortality by relocation status
+
+```{r stage-data-relocation-status}
+stage_data_binary <- qmr_dataset2 %>%
+  mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+  filter(total_stage_dead > 0, !is.na(Nest_management)) %>%
+  mutate(across(all_of(stage_cols), ~ .x / total_stage_dead, .names = "{.col}_prop")) %>%
+  pivot_longer(
+    cols = ends_with("_prop"),
+    names_to = "stage",
+    values_to = "prop"
+  ) %>%
+  mutate(
+    stage = gsub("_prop", "", stage),
+    stage_label = recode(stage, !!!stage_labels),
+    stage_label = factor(stage_label, levels = stage_labels)
+  )
+
+stage_summary_binary <- stage_data_binary %>%
+  group_by(Nest_management, stage_label) %>%
+  summarise(
+    n = n(),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd = sd(prop, na.rm = TRUE),
+    se = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(stage_summary_binary, "tables/final/stage_mortality_by_relocation_status.csv", row.names = FALSE)
+
+stage_binary_models <- map(stage_cols, function(stage_var) {
+  data_stage <- qmr_dataset2 %>%
+    mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+    filter(total_stage_dead > 0, !is.na(Nest_management)) %>%
+    mutate(
+      stage_prop = .data[[stage_var]] / total_stage_dead,
+      stage_prop_beta = beta_transform(stage_prop)
+    )
+
+  model <- betareg(stage_prop_beta ~ Nest_management, data = data_stage)
+
+  broom::tidy(model) %>%
+    filter(component == "mean", term != "(Intercept)") %>%
+    mutate(stage = stage_var)
+}) %>%
+  bind_rows() %>%
+  mutate(
+    p_holm = p.adjust(p.value, method = "holm"),
+    stage_label = recode(stage, !!!stage_labels)
+  )
+
+write.csv(stage_binary_models, "tables/final/stage_beta_models_by_relocation_status.csv", row.names = FALSE)
+
+stage_binary_models
+```
+
+```{r figure-3-stage-relocation-status, fig.width=8, fig.height=5}
+fig3 <- ggplot(stage_summary_binary, aes(x = stage_label, y = mean_prop, color = Nest_management, group = Nest_management)) +
+  geom_point(size = 3, position = position_dodge(width = 0.35)) +
+  geom_line(position = position_dodge(width = 0.35)) +
+  geom_errorbar(aes(ymin = mean_prop - sd, ymax = mean_prop + sd),
+                width = 0.15, position = position_dodge(width = 0.35)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Developmental stage at death",
+    y = "Mean proportion ± SD",
+    color = "Nest management"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+fig3
+ggsave("figures/final/Figure_3_stage_mortality_relocation_status.png", fig3, width = 8, height = 5, dpi = 300)
+```
+
+# 4. Relocation type and emergence success
+
+```{r relocation-type-model}
+reloc_type_summary <- qmr_dataset2 %>%
+  filter(!is.na(RELOC_type)) %>%
+  group_by(RELOC_type) %>%
+  summarise(
+    n = n(),
+    mean_ESUC = mean(ESUC, na.rm = TRUE),
+    sd_ESUC = sd(ESUC, na.rm = TRUE),
+    se_ESUC = sd_ESUC / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(reloc_type_summary, "tables/final/relocation_type_summary.csv", row.names = FALSE)
+
+kw_reloc_type <- kruskal.test(ESUC_prop ~ RELOC_type, data = qmr_dataset2)
+
+beta_reloc_type <- betareg(ESUC_prop_beta ~ RELOC_type, data = qmr_dataset2)
+beta_reloc_type_null <- betareg(ESUC_prop_beta ~ 1, data = qmr_dataset2)
+reloc_type_lrtest <- lmtest::lrtest(beta_reloc_type, beta_reloc_type_null)
+
+reloc_type_emm <- emmeans(beta_reloc_type, ~ RELOC_type, type = "response")
+reloc_type_pairs <- pairs(reloc_type_emm, adjust = "BH")
+
+sink("outputs/model_summaries/beta_relocation_type.txt")
+print(kw_reloc_type)
+print(summary(beta_reloc_type))
+print(reloc_type_lrtest)
+print(reloc_type_emm)
+print(reloc_type_pairs)
+sink()
+
+kw_reloc_type
+summary(beta_reloc_type)
+reloc_type_lrtest
+reloc_type_emm
+reloc_type_pairs
+```
+
+```{r figure-4-relocation-type, fig.width=7, fig.height=5}
+fig4 <- qmr_dataset2 %>%
+  filter(RELOC_type != "In situ") %>%
+  ggplot(aes(x = RELOC_type, y = prop_UH, fill = RELOC_type)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1.7) +
+  labs(
+    x = "Relocation type",
+    y = "Proportion unhatched eggs",
+    fill = "Relocation type"
+  ) +
+  theme(legend.position = "none")
+
+fig4
+ggsave("figures/final/Figure_4_unhatched_by_relocation_type.png", fig4, width = 7, height = 5, dpi = 300)
+```
+
+# 5. Developmental-stage mortality by relocation type
+
+```{r stage-data-relocation-type}
+stage_data_type <- qmr_dataset2 %>%
+  mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+  filter(total_stage_dead > 0, !is.na(RELOC_type)) %>%
+  mutate(across(all_of(stage_cols), ~ .x / total_stage_dead, .names = "{.col}_prop")) %>%
+  pivot_longer(
+    cols = ends_with("_prop"),
+    names_to = "stage",
+    values_to = "prop"
+  ) %>%
+  mutate(
+    stage = gsub("_prop", "", stage),
+    stage_label = recode(stage, !!!stage_labels),
+    stage_label = factor(stage_label, levels = stage_labels)
+  )
+
+stage_summary_type <- stage_data_type %>%
+  group_by(RELOC_type, stage_label) %>%
+  summarise(
+    n = n(),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd = sd(prop, na.rm = TRUE),
+    se = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(stage_summary_type, "tables/final/stage_mortality_by_relocation_type.csv", row.names = FALSE)
+
+stage_type_models <- map(stage_cols, function(stage_var) {
+  data_stage <- qmr_dataset2 %>%
+    mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+    filter(total_stage_dead > 0, !is.na(RELOC_type)) %>%
+    mutate(
+      stage_prop = .data[[stage_var]] / total_stage_dead,
+      stage_prop_beta = beta_transform(stage_prop)
+    )
+
+  model <- betareg(stage_prop_beta ~ RELOC_type, data = data_stage)
+  emm <- emmeans(model, ~ RELOC_type, type = "response")
+  pairwise <- as.data.frame(pairs(emm, adjust = "BH")) %>%
+    mutate(stage = stage_var)
+
+  model_tidy <- broom::tidy(model) %>%
+    filter(component == "mean", term != "(Intercept)") %>%
+    mutate(stage = stage_var)
+
+  list(model = model_tidy, pairwise = pairwise)
+})
+
+stage_type_model_table <- map_dfr(stage_type_models, "model") %>%
+  mutate(
+    p_holm = p.adjust(p.value, method = "holm"),
+    stage_label = recode(stage, !!!stage_labels)
+  )
+
+stage_type_pairwise_table <- map_dfr(stage_type_models, "pairwise") %>%
+  mutate(
+    p_holm = p.adjust(p.value, method = "holm"),
+    stage_label = recode(stage, !!!stage_labels)
+  )
+
+write.csv(stage_type_model_table, "tables/final/stage_beta_models_by_relocation_type.csv", row.names = FALSE)
+write.csv(stage_type_pairwise_table, "tables/final/stage_pairwise_by_relocation_type.csv", row.names = FALSE)
+
+stage_type_model_table
+stage_type_pairwise_table
+```
+
+```{r figure-5-stage-relocation-type, fig.width=10, fig.height=5}
+fig5 <- ggplot(stage_data_type, aes(x = stage_label, y = prop, fill = RELOC_type)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  labs(
+    x = "Developmental stage at death",
+    y = "Proportion of unhatched eggs",
+    fill = "Nest management"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+fig5
+ggsave("figures/final/Figure_5_stage_mortality_relocation_type.png", fig5, width = 10, height = 5, dpi = 300)
+```
+
+# 6. Age class and emergence success
+
+```{r age-class-model}
+age_data <- qmr_dataset2 %>%
+  filter(!is.na(AGECL), !is.na(ESUC_prop_beta))
+
+age_summary <- age_data %>%
+  group_by(AGECL) %>%
+  summarise(
+    n = n(),
+    mean_ESUC = mean(ESUC, na.rm = TRUE),
+    sd_ESUC = sd(ESUC, na.rm = TRUE),
+    se_ESUC = sd_ESUC / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(age_summary, "tables/final/age_class_summary.csv", row.names = FALSE)
+
+beta_age <- betareg(ESUC_prop_beta ~ AGECL, data = age_data)
+beta_age_null <- betareg(ESUC_prop_beta ~ 1, data = age_data)
+age_lrtest <- lmtest::lrtest(beta_age, beta_age_null)
+
+age_emm <- emmeans(beta_age, ~ AGECL, type = "response")
+age_pairs <- pairs(age_emm, adjust = "BH")
+
+sink("outputs/model_summaries/beta_age_class.txt")
+print(summary(beta_age))
+print(age_lrtest)
+print(age_emm)
+print(age_pairs)
+sink()
+
+summary(beta_age)
+age_lrtest
+age_pairs
+```
+
+```{r figure-6-age-class, fig.width=10, fig.height=5}
+fig6 <- ggplot(age_data, aes(x = AGECL, y = ESUC_prop)) +
+  geom_boxplot(fill = "grey80", outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 1.5) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Age class",
+    y = "Emergence success"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig6
+ggsave("figures/final/Figure_6_age_class_ESUC.png", fig6, width = 10, height = 5, dpi = 300)
+```
+
+```{r age-stage-models}
+age_stage_data <- qmr_dataset2 %>%
+  filter(!is.na(AGECL)) %>%
+  mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+  filter(total_stage_dead > 0) %>%
+  mutate(across(all_of(stage_cols), ~ .x / total_stage_dead, .names = "{.col}_prop")) %>%
+  pivot_longer(
+    cols = ends_with("_prop"),
+    names_to = "stage",
+    values_to = "prop"
+  ) %>%
+  mutate(
+    stage = gsub("_prop", "", stage),
+    stage_label = recode(stage, !!!stage_labels),
+    stage_label = factor(stage_label, levels = stage_labels)
+  )
+
+age_stage_summary <- age_stage_data %>%
+  group_by(AGECL, stage_label) %>%
+  summarise(
+    n = n(),
+    mean_prop = mean(prop, na.rm = TRUE),
+    se = sd(prop, na.rm = TRUE) / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(age_stage_summary, "tables/final/stage_mortality_by_age_class.csv", row.names = FALSE)
+```
+
+```{r figure-7-age-stage, fig.width=12, fig.height=6}
+fig7 <- ggplot(age_stage_data, aes(x = AGECL, y = prop, fill = stage_label)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+  labs(
+    x = "Age class",
+    y = "Proportion of embryonic mortality",
+    fill = "Developmental stage"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig7
+ggsave("figures/final/Figure_7_stage_mortality_age_class.png", fig7, width = 12, height = 6, dpi = 300)
+```
+
+# 7. Temperature and rainfall
+
+```{r temperature-rainfall-model, eval=TRUE}
+# This section will run only if temperature and/or rainfall columns exist.
+# If your temperature/rainfall file is separate, join it to qmr_dataset2 first
+# and name the columns TEMPERATURE and RAINFALL.
+
+weather_cols <- names(qmr_dataset2)[toupper(names(qmr_dataset2)) %in% c("TEMPERATURE", "TEMP", "TMAX", "RAINFALL", "RAIN")]
+weather_cols
+
+if ("TEMPERATURE" %in% names(qmr_dataset2)) {
+  temp_data <- qmr_dataset2 %>%
+    filter(!is.na(TEMPERATURE), !is.na(ESUC_prop_beta))
+
+  beta_temp <- betareg(ESUC_prop_beta ~ TEMPERATURE, data = temp_data)
+  beta_temp_null <- betareg(ESUC_prop_beta ~ 1, data = temp_data)
+
+  if ("RAINFALL" %in% names(temp_data)) {
+    beta_temp_rain <- betareg(ESUC_prop_beta ~ TEMPERATURE + RAINFALL, data = temp_data)
+    temp_model_comparison <- AIC(beta_temp, beta_temp_rain)
+  } else {
+    beta_temp_rain <- NULL
+    temp_model_comparison <- AIC(beta_temp, beta_temp_null)
+  }
+
+  sink("outputs/model_summaries/beta_temperature_rainfall.txt")
+  print(summary(beta_temp))
+  print(temp_model_comparison)
+  sink()
+
+  print(summary(beta_temp))
+  print(temp_model_comparison)
+
+  temp_pred <- data.frame(
+    TEMPERATURE = seq(min(temp_data$TEMPERATURE, na.rm = TRUE),
+                      max(temp_data$TEMPERATURE, na.rm = TRUE),
+                      length.out = 100)
+  )
+
+  temp_pred$fit <- predict(beta_temp, newdata = temp_pred, type = "response")
+
+  fig8 <- ggplot(temp_data, aes(x = TEMPERATURE, y = ESUC_prop)) +
+    geom_point(alpha = 0.45) +
+    geom_line(data = temp_pred, aes(x = TEMPERATURE, y = fit), linewidth = 1) +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      x = "Daily maximum temperature",
+      y = "Emergence success"
+    )
+
+  print(fig8)
+  ggsave("figures/final/Figure_8_temperature_beta_regression.png", fig8, width = 7, height = 5, dpi = 300)
+} else {
+  message("No TEMPERATURE column found in qmr_dataset2. Skipping temperature/rainfall model.")
+}
+```
+
+# 8. Clutch number, relocation, and emergence success
+
+```{r clutch-number-model}
+clutch_data <- qmr_dataset2 %>%
+  filter(!is.na(CNO), !is.na(Nest_management), CNO != 7) %>%
+  mutate(
+    CNO_factor = factor(CNO),
+    TAG = factor(TAG)
+  )
+
+# Binomial GLMM using emergence success proportion with weights = 100.
+# This follows the final approach used to test CNO × relocation status while accounting for repeated TAG.
+glmm_clutch <- glmer(
+  ESUC_prop ~ CNO * Nest_management + (1 | TAG),
+  data = clutch_data,
+  family = binomial(link = "logit"),
+  weights = rep(100, nrow(clutch_data)),
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+glmm_clutch_null <- glmer(
+  ESUC_prop ~ 1 + (1 | TAG),
+  data = clutch_data,
+  family = binomial(link = "logit"),
+  weights = rep(100, nrow(clutch_data)),
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+glmm_clutch_no_interaction <- glmer(
+  ESUC_prop ~ CNO + Nest_management + (1 | TAG),
+  data = clutch_data,
+  family = binomial(link = "logit"),
+  weights = rep(100, nrow(clutch_data)),
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+clutch_lrt <- anova(glmm_clutch_no_interaction, glmm_clutch, test = "Chisq")
+
+clutch_emm <- emmeans(glmm_clutch, ~ CNO | Nest_management, type = "response")
+clutch_emm_table <- as.data.frame(clutch_emm)
+
+write.csv(clutch_emm_table, "tables/final/clutch_number_emmeans.csv", row.names = FALSE)
+
+sink("outputs/model_summaries/glmm_clutch_number_relocation.txt")
+print(summary(glmm_clutch))
+print(anova(glmm_clutch_null, glmm_clutch_no_interaction, glmm_clutch, test = "Chisq"))
+print(clutch_lrt)
+print(clutch_emm)
+sink()
+
+summary(glmm_clutch)
+clutch_lrt
+clutch_emm_table
+```
+
+```{r figure-9-clutch-number, fig.width=8, fig.height=5}
+fig9_data <- clutch_data %>%
+  group_by(CNO, Nest_management) %>%
+  summarise(
+    n = n(),
+    mean_esuc = mean(ESUC_prop, na.rm = TRUE),
+    se = sd(ESUC_prop, na.rm = TRUE) / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(fig9_data, "tables/final/clutch_number_observed_means.csv", row.names = FALSE)
+
+fig9 <- ggplot(fig9_data, aes(x = CNO, y = mean_esuc, color = Nest_management, group = Nest_management)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_esuc - se, ymax = mean_esuc + se), width = 0.1) +
+  scale_x_continuous(breaks = sort(unique(fig9_data$CNO))) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Clutch number",
+    y = "Mean emergence success ± SE",
+    color = "Nest management"
+  )
+
+fig9
+ggsave("figures/final/Figure_9_clutch_number_ESUC.png", fig9, width = 8, height = 5, dpi = 300)
+```
+
+```{r figure-10-proportion-relocated, fig.width=8, fig.height=5}
+reloc_by_cno <- clutch_data %>%
+  group_by(CNO) %>%
+  summarise(
+    n = n(),
+    n_relocated = sum(Nest_management == "Relocated", na.rm = TRUE),
+    prop_relocated = n_relocated / n,
+    .groups = "drop"
+  )
+
+write.csv(reloc_by_cno, "tables/final/proportion_relocated_by_clutch_number.csv", row.names = FALSE)
+
+fig10 <- reloc_by_cno %>%
+  ggplot(aes(x = CNO, y = prop_relocated * 100)) +
+  geom_col(alpha = 0.75, width = 0.6) +
+  geom_text(aes(label = paste0("n = ", n)), vjust = -0.5, size = 4, fontface = "bold") +
+  scale_x_continuous(
+    breaks = sort(unique(reloc_by_cno$CNO)),
+    labels = paste0(sort(unique(reloc_by_cno$CNO)), c("st", "nd", "rd", rep("th", max(reloc_by_cno$CNO) - 3))[seq_along(sort(unique(reloc_by_cno$CNO)))])
+  ) +
+  ylim(0, max(reloc_by_cno$prop_relocated * 100, na.rm = TRUE) + 10) +
+  labs(
+    x = "Clutch number",
+    y = "Clutches relocated (%)"
+  )
+
+fig10
+ggsave("figures/final/Figure_10_proportion_relocated_by_clutch_number.png", fig10, width = 8, height = 5, dpi = 300)
+```
+
+# 9. Low-performing clutches
+
+```{r low-performing-status}
+low_summary <- badnest %>%
+  group_by(Nest_management) %>%
+  summarise(
+    n = n(),
+    mean_ESUC = mean(ESUC, na.rm = TRUE),
+    sd_ESUC = sd(ESUC, na.rm = TRUE),
+    se_ESUC = sd_ESUC / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(low_summary, "tables/final/low_performing_relocation_status_summary.csv", row.names = FALSE)
+
+low_beta_reloc <- betareg(ESUC_prop_beta ~ Nest_management, data = badnest)
+low_beta_reloc_null <- betareg(ESUC_prop_beta ~ 1, data = badnest)
+low_reloc_lrtest <- lmtest::lrtest(low_beta_reloc, low_beta_reloc_null)
+
+if (sum(!is.na(badnest$LDATE_numeric)) > 10) {
+  low_beta_laydate <- betareg(ESUC_prop_beta ~ LDATE_numeric + Nest_management, data = badnest)
+  low_laydate_compare <- AIC(low_beta_reloc, low_beta_laydate)
+} else {
+  low_beta_laydate <- NULL
+  low_laydate_compare <- NA
+}
+
+sink("outputs/model_summaries/low_performing_relocation_status.txt")
+print(summary(low_beta_reloc))
+print(low_reloc_lrtest)
+print(low_laydate_compare)
+sink()
+
+summary(low_beta_reloc)
+low_reloc_lrtest
+low_laydate_compare
+```
+
+```{r figure-11-low-status, fig.width=7, fig.height=5}
+fig11 <- ggplot(badnest, aes(x = Nest_management, y = ESUC_prop, fill = Nest_management)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, alpha = 0.45, size = 1.8) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Nest relocation status",
+    y = "Emergence success",
+    fill = "Nest management"
+  ) +
+  theme(legend.position = "none")
+
+fig11
+ggsave("figures/final/Figure_11_low_performing_relocation_status.png", fig11, width = 7, height = 5, dpi = 300)
+```
+
+```{r low-performing-stages}
+low_stage_data <- badnest %>%
+  mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+  filter(total_stage_dead > 0, !is.na(Nest_management)) %>%
+  mutate(across(all_of(stage_cols), ~ .x / total_stage_dead, .names = "{.col}_prop")) %>%
+  pivot_longer(
+    cols = ends_with("_prop"),
+    names_to = "stage",
+    values_to = "prop"
+  ) %>%
+  mutate(
+    stage = gsub("_prop", "", stage),
+    stage_label = recode(stage, !!!stage_labels),
+    stage_label = factor(stage_label, levels = stage_labels)
+  )
+
+low_stage_summary <- low_stage_data %>%
+  group_by(Nest_management, stage_label) %>%
+  summarise(
+    n = n(),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sd = sd(prop, na.rm = TRUE),
+    se = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(low_stage_summary, "tables/final/low_performing_stage_mortality_summary.csv", row.names = FALSE)
+
+low_stage_models <- map(stage_cols, function(stage_var) {
+  data_stage <- badnest %>%
+    mutate(total_stage_dead = rowSums(across(all_of(stage_cols)), na.rm = TRUE)) %>%
+    filter(total_stage_dead > 0, !is.na(Nest_management)) %>%
+    mutate(
+      stage_prop = .data[[stage_var]] / total_stage_dead,
+      stage_prop_beta = beta_transform(stage_prop)
+    )
+
+  model <- betareg(stage_prop_beta ~ Nest_management, data = data_stage)
+
+  broom::tidy(model) %>%
+    filter(component == "mean", term != "(Intercept)") %>%
+    mutate(stage = stage_var)
+}) %>%
+  bind_rows() %>%
+  mutate(
+    p_holm = p.adjust(p.value, method = "holm"),
+    stage_label = recode(stage, !!!stage_labels)
+  )
+
+write.csv(low_stage_models, "tables/final/low_performing_stage_beta_models.csv", row.names = FALSE)
+
+low_stage_models
+```
+
+```{r figure-12-low-stage, fig.width=8, fig.height=5}
+fig12 <- ggplot(low_stage_summary, aes(x = stage_label, y = mean_prop, color = Nest_management, group = Nest_management)) +
+  geom_point(size = 3, position = position_dodge(width = 0.35)) +
+  geom_line(position = position_dodge(width = 0.35)) +
+  geom_errorbar(aes(ymin = mean_prop - se, ymax = mean_prop + se),
+                width = 0.15, position = position_dodge(width = 0.35)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Developmental stage at death",
+    y = "Mean proportion ± SE",
+    color = "Nest management"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+fig12
+ggsave("figures/final/Figure_12_low_performing_stage_mortality.png", fig12, width = 8, height = 5, dpi = 300)
+```
+
+```{r low-performing-relocation-type}
+low_type_data <- badnest %>%
+  filter(!is.na(RELOC_type))
+
+low_kw_type <- kruskal.test(ESUC_prop ~ RELOC_type, data = low_type_data)
+
+low_beta_type <- betareg(ESUC_prop_beta ~ RELOC_type, data = low_type_data)
+low_beta_type_null <- betareg(ESUC_prop_beta ~ 1, data = low_type_data)
+low_type_lrtest <- lmtest::lrtest(low_beta_type, low_beta_type_null)
+
+low_type_emm <- emmeans(low_beta_type, ~ RELOC_type, type = "response")
+low_type_pairs <- pairs(low_type_emm, adjust = "BH")
+
+sink("outputs/model_summaries/low_performing_relocation_type.txt")
+print(low_kw_type)
+print(summary(low_beta_type))
+print(low_type_lrtest)
+print(low_type_emm)
+print(low_type_pairs)
+sink()
+
+low_kw_type
+summary(low_beta_type)
+low_type_lrtest
+low_type_pairs
+```
+
+```{r figure-13-low-type, fig.width=8, fig.height=5}
+fig13 <- ggplot(low_type_data, aes(x = RELOC_type, y = ESUC_prop, fill = RELOC_type)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.55) +
+  geom_jitter(width = 0.15, alpha = 0.45, size = 1.8) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Relocation type",
+    y = "Emergence success",
+    fill = "Relocation type"
+  ) +
+  theme(legend.position = "none")
+
+fig13
+ggsave("figures/final/Figure_13_low_performing_relocation_type.png", fig13, width = 8, height = 5, dpi = 300)
+```
+
+# 10. Additional non-parametric screening tests
+
+```{r nonparametric-screens}
+# These were useful screening tests but should only be reported if they remain in the thesis.
+
+screen_tests <- list()
+
+if ("SECT" %in% names(qmr_dataset2)) {
+  screen_tests$ESUC_by_SECT <- kruskal.test(ESUC_prop ~ as.factor(SECT), data = qmr_dataset2)
+}
+
+if ("LDATE_numeric" %in% names(qmr_dataset2)) {
+  # Kruskal-Wallis requires groups, so use LDATE as factor if desired.
+  screen_tests$ESUC_by_LDATE <- kruskal.test(ESUC_prop ~ as.factor(LDATE_numeric), data = qmr_dataset2)
+}
+
+if ("RELOC" %in% names(qmr_dataset2)) {
+  screen_tests$ESUC_by_RELOC_original <- kruskal.test(ESUC_prop ~ as.factor(RELOC), data = qmr_dataset2)
+}
+
+if ("TAG" %in% names(qmr_dataset2)) {
+  # This can be statistically significant but hard to interpret because of many groups.
+  screen_tests$ESUC_by_TAG <- kruskal.test(ESUC_prop ~ as.factor(TAG), data = qmr_dataset2)
+}
+
+sink("outputs/model_summaries/nonparametric_screening_tests.txt")
+print(screen_tests)
+sink()
+
+screen_tests
+```
+
+# 11. Save final R session information
+
+```{r session-info}
+sink("outputs/model_summaries/session_info.txt")
+sessionInfo()
+sink()
+
+sessionInfo()
+```
